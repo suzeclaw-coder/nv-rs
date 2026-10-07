@@ -92,6 +92,7 @@ impl Plugin for HitEffectsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<HitReports>()
             .init_resource::<HitEffects>()
+            .init_resource::<crate::grade::PhysiologicalState>()
             .add_systems(
                 Update,
                 play_hits
@@ -123,6 +124,7 @@ pub struct HitParams<'w, 's> {
     screen: ResMut<'w, crate::effects::Effects>,
     audio: ResMut<'w, Assets<AudioSource>>,
     cameras: Query<'w, 's, &'static Transform, With<FlyCamera>>,
+    phys: ResMut<'w, crate::grade::PhysiologicalState>,
 }
 
 /// Plays this frame's hits.
@@ -232,9 +234,25 @@ fn on_someone(
             heard.join(", ")
         );
     }
-    // The player hit by someone: the hit modifier at its strength.
-    if target == PLAYER_REF && r.attacker != PLAYER_REF {
-        let (modifier, strength) = impacts::get_hit_modifier(order);
+    // The player hit by someone or self-inflicted:
+    if target == PLAYER_REF {
+        let max_hp = world::combat::max_health(order, &p.state.0, PLAYER_REF).unwrap_or(100.0) as f32;
+        let damage = r.damage.max(0.0);
+        let heavy_threshold = (max_hp * 0.15).max(15.0);
+        let is_heavy = damage >= heavy_threshold;
+
+        // Immediate trauma impulse scaled with hit damage
+        let damage_ratio = if max_hp > 0.0 { damage / max_hp } else { 0.2 };
+        let trauma_impulse = (damage_ratio * 3.0 + if is_heavy { 0.5 } else { 0.2 }).clamp(0.2, 2.0);
+        p.phys.trigger_trauma(trauma_impulse, is_heavy);
+
+        // Heavy hits on the player trigger immediate trauma impulses & boosted pain modifier
+        let (modifier, base_strength) = impacts::get_hit_modifier(order);
+        let strength = if is_heavy {
+            base_strength * (1.0 + (damage / heavy_threshold).min(2.0))
+        } else {
+            base_strength
+        };
         p.screen.instances.push((modifier, now, strength));
     }
     // What they say or cry out.
@@ -331,5 +349,32 @@ mod tests {
         assert_eq!(r.havok, Some(9));
         assert!((r.point[0]).abs() < 1e-3);
         assert_eq!((r.target, r.weapon), (None, Some(FormId(0x123))));
+    }
+
+    #[test]
+    fn player_heavy_hit_triggers_trauma_and_concussion() {
+        let mut phys = crate::grade::PhysiologicalState::default();
+        let max_hp = 100.0f32;
+        let heavy_threshold = (max_hp * 0.15).max(15.0);
+
+        // Light hit (5 damage)
+        let light_dmg = 5.0f32;
+        let is_heavy_light = light_dmg >= heavy_threshold;
+        assert!(!is_heavy_light);
+        let ratio_light = light_dmg / max_hp;
+        let impulse_light = (ratio_light * 3.0 + if is_heavy_light { 0.5 } else { 0.2 }).clamp(0.2, 2.0);
+        phys.trigger_trauma(impulse_light, is_heavy_light);
+        assert!(phys.trauma > 0.0);
+        assert_eq!(phys.concussion, 0.0);
+
+        // Heavy hit (35 damage)
+        let heavy_dmg = 35.0f32;
+        let is_heavy = heavy_dmg >= heavy_threshold;
+        assert!(is_heavy);
+        let ratio_heavy = heavy_dmg / max_hp;
+        let impulse_heavy = (ratio_heavy * 3.0 + if is_heavy { 0.5 } else { 0.2 }).clamp(0.2, 2.0);
+        phys.trigger_trauma(impulse_heavy, is_heavy);
+        assert!(phys.trauma >= 1.5);
+        assert!(phys.concussion >= 0.6);
     }
 }

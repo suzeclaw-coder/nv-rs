@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! nv-viewer: walk around a Fallout: New Vegas cell in real time.
 //!
 //! The game-specific work (reading the cell, placing models, textures and

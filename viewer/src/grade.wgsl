@@ -31,6 +31,9 @@ struct ImageSpaceGrade {
     hdr: vec4<f32>,
     // The colour the picture fades to, and how far.
     fade: vec4<f32>,
+    // Physiological effects:
+    // x: tunnel vision intensity; y: pulse intensity; z: color temperature shift; w: trauma intensity
+    physiological: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> grade: ImageSpaceGrade;
 // The bloom (final pass) or the average brightness (bright pass).
@@ -144,8 +147,31 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     c = mix(vec3<f32>(lum), c, grade.cinematic.x);
     c = mix(c, lum * grade.tint.rgb, grade.tint.a);
     c = mix(vec3<f32>(grade.cinematic.z), c * grade.cinematic.w, grade.cinematic.y);
+
+    // Color temperature shift (hypovolemic cold cyan vs warm arterial red pulse)
+    let temp_shift = grade.physiological.z;
+    if abs(temp_shift) > 0.001 {
+        let temp_tint = vec3<f32>(
+            1.0 + temp_shift * 0.35,
+            1.0 - abs(temp_shift) * 0.05,
+            1.0 - temp_shift * 0.35
+        );
+        c = c * max(temp_tint, vec3<f32>(0.0));
+    }
+
     // Last, the fade (`lerp(c, Fade.rgb, Fade.w)`).
     c = mix(c, grade.fade.rgb, grade.fade.a);
+
+    // Concussion / low-health tunnel vision:
+    let tunnel = grade.physiological.x;
+    if tunnel > 0.001 {
+        let uv_dist = length(in.uv - vec2<f32>(0.5)) * 1.4142;
+        let inner_rad = max(0.15, 1.0 - tunnel * 0.75);
+        let outer_rad = max(inner_rad + 0.12, 1.35 - tunnel * 0.45);
+        let vignette = 1.0 - smoothstep(inner_rad, outer_rad, uv_dist);
+        let dark_color = vec3<f32>(0.015 * grade.physiological.y, 0.0, 0.0);
+        c = mix(dark_color, c, vignette);
+    }
     // The game writes this into its 8-bit frame buffer (clamped), then
     // draws the HUD over it, each piece source alpha over inverse source
     // alpha: the same as laying the HUD's picture over it once.

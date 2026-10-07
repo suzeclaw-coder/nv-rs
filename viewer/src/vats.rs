@@ -1684,6 +1684,7 @@ fn play(
             }
         };
         rebase(&mut attack.fired_at);
+        rebase(&mut attack.dry_fired_at);
         rebase(&mut attack.reload_started);
         vats.player_mult = ts.player;
     }

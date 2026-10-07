@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod ai;
+pub mod audio;
 pub mod fighting;
 pub mod functions;
 pub mod impacts;

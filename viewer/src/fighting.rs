@@ -30,7 +30,7 @@
 //! as for those without one), suppressive fire, reloads, grenades, spread
 //! (every shot hits), the hit landing at the attack animation's hit key.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use esm::{FormId, LoadOrder};
 use world::ai::NavMesh;
@@ -147,6 +147,20 @@ impl Move {
 
 /// A fight under way: what's known of the target, the gunman's and the
 /// swordsman's timers, the move under way.
+/// An attack windup (telegraph window) under way for a melee combatant:
+/// forward momentum decelerates, committing to the lunge direction,
+/// giving the player an evasion window before the strike key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MeleeWindup {
+    pub start: f32,
+    pub strike_at: f32,
+    pub end: f32,
+    pub lunge_dir: [f32; 2],
+    pub lunge_speed: f32,
+    pub power: bool,
+    pub weapon: Option<FormId>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Fight {
     pub memory: TargetMemory,
@@ -154,6 +168,8 @@ pub(crate) struct Fight {
     ranged: RangedAttack,
     /// When the attack under way ends; holding until when.
     attack_until: f32,
+    /// Active attack telegraph windup window under way.
+    pub(crate) windup: Option<MeleeWindup>,
     holding: bool,
     hold_until: f32,
     /// The target's last detection value and whether it was in sight.
@@ -173,6 +189,7 @@ impl Fight {
             engage: Engage::default(),
             ranged: RangedAttack::default(),
             attack_until: f32::NEG_INFINITY,
+            windup: None,
             holding: false,
             hold_until: f32::NEG_INFINITY,
             in_sight: true,
@@ -659,8 +676,139 @@ fn ranged(
     }
 }
 
-/// A melee fighter's frame: closing in (`melee_approach`), then rolling
-/// attack or hold after each attack (`melee_choice`).
+/// Computes a lateral flank target perpendicular to the player approach vector,
+/// spreading multiple pursuing melee enemies into an encircling crescent / pincer formation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_flank_steering(
+    me: FormId,
+    my_pos: [f32; 3],
+    my_radius: f32,
+    target_pos: [f32; 3],
+    target_radius: f32,
+    reach: f32,
+    others: &[Seen],
+    combat: &HashMap<FormId, FormId>,
+    target: FormId,
+    dead: &HashSet<FormId>,
+) -> [f32; 3] {
+    let dx = target_pos[0] - my_pos[0];
+    let dy = target_pos[1] - my_pos[1];
+    let dist = dx.hypot(dy);
+    if dist < 1e-2 {
+        return target_pos;
+    }
+    let fwd = [dx / dist, dy / dist];
+    let tangent = [-fwd[1], fwd[0]];
+
+    // Find all active co-pursuers targeting the same target.
+    let mut pursuers: Vec<(FormId, [f32; 3], f32)> = Vec::with_capacity(others.len() + 1);
+    pursuers.push((me, my_pos, my_radius));
+    for o in others {
+        if o.reference != me
+            && o.reference != target
+            && !dead.contains(&o.reference)
+            && combat.get(&o.reference) == Some(&target)
+        {
+            pursuers.push((o.reference, o.position, o.radius));
+        }
+    }
+
+    if pursuers.len() <= 1 {
+        return target_pos;
+    }
+
+    // Sort pursuers along their transverse projection relative to target_pos across tangent.
+    pursuers.sort_by(|a, b| {
+        let t_a = (a.1[0] - target_pos[0]) * tangent[0] + (a.1[1] - target_pos[1]) * tangent[1];
+        let t_b = (b.1[0] - target_pos[0]) * tangent[0] + (b.1[1] - target_pos[1]) * tangent[1];
+        t_a.partial_cmp(&t_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0 .0.cmp(&b.0 .0))
+    });
+
+    let n = pursuers.len();
+    let my_rank = pursuers.iter().position(|p| p.0 == me).unwrap_or(0);
+    let flank_slot = my_rank as f32 - (n - 1) as f32 * 0.5;
+    let max_slot = ((n - 1) as f32 * 0.5).max(1.0);
+    let norm_slot = flank_slot / max_slot; // in range [-1.0, 1.0]
+
+    // Crescent encircling angle: up to ~55 degrees (0.95 rad) on either flank.
+    let angle = norm_slot * 0.95;
+    let encircle_r = (reach * 0.85 + target_radius + my_radius).max(64.0);
+
+    let sin_a = angle.sin();
+    let cos_a = angle.cos();
+
+    // Offset around target_pos forming an encircling crescent:
+    let offset_x = -fwd[0] * (encircle_r * cos_a) + tangent[0] * (encircle_r * sin_a);
+    let offset_y = -fwd[1] * (encircle_r * cos_a) + tangent[1] * (encircle_r * sin_a);
+
+    [target_pos[0] + offset_x, target_pos[1] + offset_y, target_pos[2]]
+}
+
+/// When trailing closely behind another pursuer along the player approach vector,
+/// applies lateral repulsion perpendicular to the approach vector to break collinear
+/// alignment and force enemies into side-by-side pursuit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_boid_separation(
+    me: FormId,
+    my_pos: [f32; 3],
+    my_radius: f32,
+    fwd: [f32; 2],
+    tangent: [f32; 2],
+    run_speed: f32,
+    others: &[Seen],
+    combat: &HashMap<FormId, FormId>,
+    target: FormId,
+    dead: &HashSet<FormId>,
+) -> [f32; 2] {
+    let mut lateral_repulsion = 0.0f32;
+
+    for o in others {
+        if o.reference == me || o.reference == target || dead.contains(&o.reference) {
+            continue;
+        }
+        if combat.get(&o.reference) != Some(&target) {
+            continue;
+        }
+
+        let dx = o.position[0] - my_pos[0];
+        let dy = o.position[1] - my_pos[1];
+        let along = dx * fwd[0] + dy * fwd[1];
+        let lateral = dx * tangent[0] + dy * tangent[1];
+
+        let trail_distance_max = (my_radius + o.radius) * 3.5;
+        let collinear_threshold = (my_radius + o.radius) * 1.25;
+
+        // Trailing closely behind another pursuer along the approach line:
+        if along > 0.0 && along < trail_distance_max && lateral.abs() < collinear_threshold {
+            let side = if lateral > 1e-2 {
+                -1.0
+            } else if lateral < -1e-2 || (me.0 ^ o.reference.0) & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+
+            let along_factor = 1.0 - (along / trail_distance_max);
+            let lateral_factor = 1.0 - (lateral.abs() / collinear_threshold);
+            let strength = along_factor * lateral_factor;
+
+            lateral_repulsion += side * (run_speed * 0.8) * strength;
+        } else if along.abs() < (my_radius + o.radius) * 0.75 && lateral.abs() < collinear_threshold {
+            // Side-by-side crowding buffer to keep comfortable shoulder separation
+            let side = if lateral > 0.0 { -1.0 } else { 1.0 };
+            let overlap = 1.0 - (lateral.abs() / collinear_threshold);
+            lateral_repulsion += side * (run_speed * 0.4) * overlap;
+        }
+    }
+
+    let clamped = lateral_repulsion.clamp(-run_speed, run_speed);
+    [tangent[0] * clamped, tangent[1] * clamped]
+}
+
+/// A melee fighter's frame: closing in with crescent flank steering and boid separation,
+/// telegraphing committed attack lunges with an evasion window, and rolling attack or hold.
 fn melee(
     c: &mut FightCtx,
     state: &mut GameState,
@@ -679,34 +827,166 @@ fn melee(
     let reach = combat_ai::melee_reach(weapon, creature, walker.scale, &s);
     let them = c.others.iter().find(|o| o.reference == target);
     let their_radius = them.map_or(combat_ai::PERSON_RADIUS, |o| o.radius);
-    // Out of sight for a moment: toward where they were last seen.
-    let toward = if fight.memory.unseen_for(now) > 0.5 {
+
+    // 1. Committed Attack Telegraphing & Evasion Windows:
+    if let Some(w) = fight.windup {
+        // Interruption check: attacker staggered/unconscious/dead, or target dead
+        if state.dead.contains(&walker.reference) || state.unconscious.contains(&walker.reference) {
+            fight.windup = None;
+            fight.attack_until = now;
+            return FightFrame::default();
+        }
+        if state.dead.contains(&target) {
+            fight.windup = None;
+            fight.attack_until = now;
+            return FightFrame::default();
+        }
+
+        if now < w.strike_at {
+            // Still in committed windup window: forward momentum decelerates smoothly to 0
+            let duration = (w.strike_at - w.start).max(1e-3);
+            let progress = ((now - w.start) / duration).clamp(0.0, 1.0);
+            let momentum = (1.0 - progress) * w.lunge_speed;
+            let step_dist = momentum * c.dt;
+            walker.position[0] += w.lunge_dir[0] * step_dist;
+            walker.position[1] += w.lunge_dir[1] * step_dist;
+            walker.heading = w.lunge_dir[0].atan2(w.lunge_dir[1]);
+            walker.path.clear();
+            return FightFrame {
+                gait: None,
+                attacked: false,
+            };
+        } else {
+            // Windup complete: Strike execution and evasion detection!
+            fight.windup = None;
+            fight.attack_until = w.end;
+
+            // Hit detection & evasion window: check if target backstepped, dodged, or slipped out of arc
+            let current_dist = distance(walker.position, goal);
+            let gap = combat_ai::gap(current_dist, kit.radius, their_radius);
+            let (yaw, _) = offsets(walker.position, walker.heading, goal);
+            let in_range = gap <= reach;
+            let in_arc = yaw.abs() <= std::f32::consts::FRAC_PI_2;
+
+            if in_range && in_arc {
+                if let Some(sound) = weapon.and_then(|w| w.sound) {
+                    c.sounds.0.push(sound);
+                }
+                let dealt = Runner::new(order, c.scripts, state).strike(
+                    walker.reference,
+                    target,
+                    weapon,
+                    w.power,
+                );
+                if let Some(dmg) = dealt {
+                    report_hit(
+                        c,
+                        state,
+                        walker.reference,
+                        (target, goal),
+                        w.weapon,
+                        dmg,
+                    );
+                    let left = world::combat::health(order, state, target).unwrap_or(0.0);
+                    println!(
+                        "{now:.1} s: {} {} {target} for {dmg:.1} ({left:.1} left).",
+                        walker.reference,
+                        if w.power { "power-attacks" } else { "hits" }
+                    );
+                }
+            } else {
+                println!(
+                    "{now:.1} s: {target} evaded {}'s attack (gap {gap:.0} vs reach {reach:.0}, yaw {yaw:.2}).",
+                    walker.reference
+                );
+            }
+            return FightFrame {
+                gait: None,
+                attacked: false,
+            };
+        }
+    }
+
+    // 2. Approach & Steering:
+    let toward_spot = if fight.memory.unseen_for(now) > 0.5 {
         fight.memory.last_known
     } else {
         goal
     };
-    let gap = combat_ai::gap(distance(walker.position, toward), kit.radius, their_radius);
+    let gap = combat_ai::gap(distance(walker.position, toward_spot), kit.radius, their_radius);
     let gait = match combat_ai::melee_approach(gap, reach, &s) {
         Approach::Run => Some(Gait::Run),
         Approach::FastWalk => Some(Gait::FastWalk),
         Approach::InReach => None,
     };
+
     if let Some(g) = gait {
+        let (dx, dy) = (toward_spot[0] - walker.position[0], toward_spot[1] - walker.position[1]);
+        let dist = dx.hypot(dy);
+        let (fwd, tangent) = if dist > 1e-3 {
+            ([dx / dist, dy / dist], [-dy / dist, dx / dist])
+        } else {
+            ([0.0, 1.0], [-1.0, 0.0])
+        };
+
+        // Perpendicular Tangent Flank Steering:
+        let flank_dest = if fight.memory.unseen_for(now) > 0.5 {
+            toward_spot
+        } else {
+            compute_flank_steering(
+                walker.reference,
+                walker.position,
+                kit.radius,
+                toward_spot,
+                their_radius,
+                reach,
+                c.others,
+                &state.combat,
+                target,
+                &state.dead,
+            )
+        };
+
+        // Perpendicular Boid Separation:
+        let legs = world::body_parts::leg_speed_mult(order, state, walker.reference);
+        let current_speed = g.speed(kit.walk, kit.run) * legs;
+        let sep_vel = compute_boid_separation(
+            walker.reference,
+            walker.position,
+            kit.radius,
+            fwd,
+            tangent,
+            current_speed,
+            c.others,
+            &state.combat,
+            target,
+            &state.dead,
+        );
+
         if now >= fight.repath_at || walker.next >= walker.path.len() {
             fight.repath_at = now + REPATH_SECONDS;
-            go(c.mesh, walker, toward, true);
+            if c.mesh.path(walker.position, flank_dest).is_some() {
+                go(c.mesh, walker, flank_dest, true);
+            } else {
+                go(c.mesh, walker, toward_spot, true);
+            }
         }
-        // Crippled legs slow them (`world::body_parts::leg_speed_mult`).
-        let legs = world::body_parts::leg_speed_mult(order, state, walker.reference);
-        let walking = step(walker, g.speed(kit.walk, kit.run) * legs, c.dt);
+
+        let walking = step(walker, current_speed, c.dt);
+        // Apply lateral boid separation to break collinear alignment:
+        walker.position[0] += sep_vel[0] * c.dt;
+        walker.position[1] += sep_vel[1] * c.dt;
+
         if !walking {
-            face(walker, toward, c);
+            face(walker, toward_spot, c);
         }
         return FightFrame {
             gait: walking.then_some(g),
             attacked: false,
         };
     }
+
+    // 3. In Reach:
     walker.path.clear();
     face(walker, goal, c);
     let due = now >= fight.attack_until && (!fight.holding || now >= fight.hold_until);
@@ -729,7 +1009,6 @@ fn melee(
     match combat_ai::melee_choice(&scores, dice.roll(), fight.holding) {
         MeleeChoice::Attack => {
             fight.holding = false;
-            // Fatigue isn't kept: always full.
             let power = combat_ai::power_attack(
                 &kit.style,
                 situation.target_recoiling,
@@ -737,35 +1016,27 @@ fn melee(
                 1.0,
                 dice.roll(),
             );
-            fight.attack_until = now + kit.attack_seconds(weapon);
-            if let Some(sound) = weapon.and_then(|w| w.sound) {
-                c.sounds.0.push(sound);
-            }
-            let dealt = Runner::new(order, c.scripts, state).strike(
-                walker.reference,
-                target,
-                weapon,
+            let attack_sec = kit.attack_seconds(weapon);
+            let windup_sec = (attack_sec * 0.32).clamp(0.1, (attack_sec * 0.5).max(0.1));
+            let (dx, dy) = (goal[0] - walker.position[0], goal[1] - walker.position[1]);
+            let dist = dx.hypot(dy).max(1e-3);
+            let lunge_dir = [dx / dist, dy / dist];
+            let lunge_speed = (kit.run * 0.5).max(kit.walk);
+
+            fight.windup = Some(MeleeWindup {
+                start: now,
+                strike_at: now + windup_sec,
+                end: now + attack_sec,
+                lunge_dir,
+                lunge_speed,
                 power,
-            );
-            if let Some(dmg) = dealt {
-                report_hit(
-                    c,
-                    state,
-                    walker.reference,
-                    (target, goal),
-                    weapon.map(|w| w.form_id),
-                    dmg,
-                );
-                let left = world::combat::health(order, state, target).unwrap_or(0.0);
-                println!(
-                    "{now:.1} s: {} {} {target} for {dmg:.1} ({left:.1} left).",
-                    walker.reference,
-                    if power { "power-attacks" } else { "hits" }
-                );
-            }
+                weapon: weapon.map(|w| w.form_id),
+            });
+            fight.attack_until = now + attack_sec;
+
             FightFrame {
                 gait: None,
-                attacked: true,
+                attacked: true, // Triggers attack animation start immediately!
             }
         }
         MeleeChoice::Hold => {
@@ -892,5 +1163,228 @@ mod tests {
         assert!(draws.iter().all(|u| (0.0..1.0).contains(u)));
         // Spread over the range.
         assert!(draws.iter().any(|u| *u < 0.1) && draws.iter().any(|u| *u > 0.9));
+    }
+
+    #[test]
+    fn single_pursuer_targets_player_directly() {
+        let me = FormId(101);
+        let target = FormId(1);
+        let my_pos = [0.0, 0.0, 0.0];
+        let target_pos = [0.0, 500.0, 0.0];
+        let others = vec![];
+        let mut combat = HashMap::new();
+        combat.insert(me, target);
+        let dead = HashSet::new();
+
+        let steer = compute_flank_steering(
+            me,
+            my_pos,
+            30.0,
+            target_pos,
+            30.0,
+            80.0,
+            &others,
+            &combat,
+            target,
+            &dead,
+        );
+        assert_eq!(steer, target_pos);
+    }
+
+    #[test]
+    fn multiple_pursuers_spread_laterally_into_crescent_pincer() {
+        let p1 = FormId(101); // Left pursuer
+        let p2 = FormId(102); // Center pursuer
+        let p3 = FormId(103); // Right pursuer
+        let target = FormId(1);
+
+        let target_pos = [0.0, 500.0, 0.0];
+        let pos1 = [-100.0, 100.0, 0.0];
+        let pos2 = [0.0, 100.0, 0.0];
+        let pos3 = [100.0, 100.0, 0.0];
+
+        let mut combat = HashMap::new();
+        combat.insert(p1, target);
+        combat.insert(p2, target);
+        combat.insert(p3, target);
+        let dead = HashSet::new();
+
+        let seen = vec![
+            Seen {
+                reference: p1,
+                position: pos1,
+                moving: true,
+                running: true,
+                attacking: false,
+                radius: 30.0,
+            },
+            Seen {
+                reference: p2,
+                position: pos2,
+                moving: true,
+                running: true,
+                attacking: false,
+                radius: 30.0,
+            },
+            Seen {
+                reference: p3,
+                position: pos3,
+                moving: true,
+                running: true,
+                attacking: false,
+                radius: 30.0,
+            },
+        ];
+
+        let steer1 = compute_flank_steering(
+            p1,
+            pos1,
+            30.0,
+            target_pos,
+            30.0,
+            80.0,
+            &seen,
+            &combat,
+            target,
+            &dead,
+        );
+        let steer2 = compute_flank_steering(
+            p2,
+            pos2,
+            30.0,
+            target_pos,
+            30.0,
+            80.0,
+            &seen,
+            &combat,
+            target,
+            &dead,
+        );
+        let steer3 = compute_flank_steering(
+            p3,
+            pos3,
+            30.0,
+            target_pos,
+            30.0,
+            80.0,
+            &seen,
+            &combat,
+            target,
+            &dead,
+        );
+
+        // p1 (left) should have negative X lateral offset relative to target
+        assert!(steer1[0] < target_pos[0], "Left pursuer must flank left: {}", steer1[0]);
+        // p3 (right) should have positive X lateral offset relative to target
+        assert!(steer3[0] > target_pos[0], "Right pursuer must flank right: {}", steer3[0]);
+        // p2 (center) should stay near center X
+        assert!((steer2[0] - target_pos[0]).abs() < 5.0, "Center pursuer near center: {}", steer2[0]);
+
+        // All crescent destinations are within encirclement reach of target
+        let r1 = distance(steer1, target_pos);
+        let r2 = distance(steer2, target_pos);
+        let r3 = distance(steer3, target_pos);
+        assert!((r1 - 128.0).abs() < 10.0, "p1 on crescent ring: {r1}");
+        assert!((r2 - 128.0).abs() < 10.0, "p2 on crescent ring: {r2}");
+        assert!((r3 - 128.0).abs() < 10.0, "p3 on crescent ring: {r3}");
+    }
+
+    #[test]
+    fn trailing_pursuer_experiences_lateral_boid_repulsion() {
+        let p_front = FormId(101);
+        let p_behind = FormId(102);
+        let target = FormId(1);
+
+        let mut combat = HashMap::new();
+        combat.insert(p_front, target);
+        combat.insert(p_behind, target);
+        let dead = HashSet::new();
+
+        // Target at [0, 500, 0]. Approach vector fwd = [0, 1], tangent = [-1, 0] or [1, 0].
+        let fwd = [0.0, 1.0];
+        let tangent = [-1.0, 0.0];
+
+        // p_front is at [2.0, 150.0, 0.0] (slightly right)
+        // p_behind is at [0.0, 100.0, 0.0]
+        let seen = vec![Seen {
+            reference: p_front,
+            position: [2.0, 150.0, 0.0],
+            moving: true,
+            running: true,
+            attacking: false,
+            radius: 30.0,
+        }];
+
+        let repulse = compute_boid_separation(
+            p_behind,
+            [0.0, 100.0, 0.0],
+            30.0,
+            fwd,
+            tangent,
+            200.0,
+            &seen,
+            &combat,
+            target,
+            &dead,
+        );
+
+        // Repulsion must be non-zero and push laterally along tangent
+        assert!(repulse[0].abs() > 10.0, "Should apply lateral repulsion: {:?}", repulse);
+        assert_eq!(repulse[1], 0.0, "Perpendicular repulsion has 0 longitudinal component");
+
+        // When already wide apart laterally (e.g. at [150, 100, 0]), repulsion is zero
+        let repulse_wide = compute_boid_separation(
+            p_behind,
+            [150.0, 100.0, 0.0],
+            30.0,
+            fwd,
+            tangent,
+            200.0,
+            &seen,
+            &combat,
+            target,
+            &dead,
+        );
+        assert_eq!(repulse_wide, [0.0, 0.0], "No repulsion when side-by-side");
+    }
+
+    #[test]
+    fn attack_windup_deceleration_and_evasion_logic() {
+        let windup = MeleeWindup {
+            start: 10.0,
+            strike_at: 10.5,
+            end: 11.0,
+            lunge_dir: [0.0, 1.0],
+            lunge_speed: 150.0,
+            power: false,
+            weapon: None,
+        };
+
+        // Decelerated momentum test over time:
+        let duration = windup.strike_at - windup.start;
+        // At start (t = 10.0): progress = 0, full momentum
+        let prog_0 = ((10.0 - windup.start) / duration).clamp(0.0, 1.0);
+        let mom_0 = (1.0 - prog_0) * windup.lunge_speed;
+        assert_eq!(mom_0, 150.0);
+
+        // Halfway (t = 10.25): progress = 0.5, half momentum
+        let prog_half = ((10.25 - windup.start) / duration).clamp(0.0, 1.0);
+        let mom_half = (1.0 - prog_half) * windup.lunge_speed;
+        assert!((mom_half - 75.0).abs() < 1e-3);
+
+        // At strike key (t = 10.5): progress = 1.0, momentum decelerated to 0
+        let prog_end = ((10.5 - windup.start) / duration).clamp(0.0, 1.0);
+        let mom_end = (1.0 - prog_end) * windup.lunge_speed;
+        assert_eq!(mom_end, 0.0);
+
+        // Evasion check: player backsteps from 70 units away to 120 units away
+        let reach = 80.0;
+        let my_radius = 30.0;
+        let player_radius = 30.0;
+        let gap_close = combat_ai::gap(70.0, my_radius, player_radius);
+        let gap_evaded = combat_ai::gap(150.0, my_radius, player_radius);
+
+        assert!(gap_close <= reach, "Target in reach before backstep: {gap_close}");
+        assert!(gap_evaded > reach, "Target evaded after backstep: {gap_evaded}");
     }
 }

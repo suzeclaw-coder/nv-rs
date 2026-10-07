@@ -80,6 +80,12 @@ pub struct ImageSpaceGrade {
     /// pass's last step: `lerp(c, Fade.rgb, Fade.w)`); set by image space
     /// modifiers.
     pub fade: Vec4,
+    /// Physiological low-health feedback, crippled limb effects, and concussion/hit dynamics:
+    /// `x`: tunnel vision intensity (0.0 = none, 1.0 = heavy peripheral constriction)
+    /// `y`: pulse throb intensity (0.0 = none, >0.0 = arterial systolic surge)
+    /// `z`: color temperature shift (-1.0 = cold/cyan shock pallor, +1.0 = warm/red arterial flush)
+    /// `w`: raw trauma impulse intensity (0.0 .. 2.0)
+    pub physiological: Vec4,
 }
 
 /// A camera whose final passes are left to a later camera on the same
@@ -99,6 +105,7 @@ impl ImageSpaceGrade {
         bloom: Vec4::new(1.0, 0.0, 0.0, 1.0),
         hdr: Vec4::new(1.0, 0.0, 0.0, 0.0),
         fade: Vec4::ZERO,
+        physiological: Vec4::ZERO,
     };
 
     /// The same with image space modifiers playing (`world::modifier`):
@@ -212,6 +219,248 @@ impl ImageSpaceGrade {
             ..self
         }
     }
+
+    /// Adjusts post-tonemapping saturation, color temperature, and contrast dynamically
+    /// during low-health or pain/concussion states to convey shock and fading consciousness.
+    pub fn with_physiological(self, phys: &PhysiologicalState) -> Self {
+        let mut out = self;
+        let sev = phys.low_health_severity;
+        let trauma = phys.trauma.clamp(0.0, 2.0);
+        let pulse_active = sev > 0.0 || trauma > 0.0;
+        let pulse_effect = if pulse_active {
+            phys.pulse * (sev * 0.85 + trauma * 0.45).min(1.2)
+        } else {
+            0.0
+        };
+
+        // 1. Post-tonemapping saturation: fading consciousness desaturation
+        let desat = (1.0 - 0.75 * sev * (1.0 - 0.25 * phys.pulse))
+            * (1.0 - 0.45 * trauma.min(1.0))
+            * if phys.head_crippled { 0.75 } else { 1.0 };
+        out.cinematic.x *= desat.clamp(0.05, 1.0);
+
+        // 2. Contrast & brightness dynamics: shock & throb
+        let contrast_boost = 1.0 + 0.35 * sev * phys.pulse + 0.45 * trauma;
+        out.cinematic.y *= contrast_boost;
+
+        // Brightness dims between heartbeats (fading consciousness), surging during pulse
+        let brightness_mod = 1.0 - 0.35 * sev * (1.0 - 0.7 * phys.pulse) - 0.25 * trauma;
+        out.cinematic.w *= brightness_mod.clamp(0.25, 1.5);
+
+        // 3. Color temperature & arterial red pulse tint
+        let cold_shock = -0.55 * sev - 0.35 * trauma;
+        let warm_pulse = 0.75 * pulse_effect;
+        let temp_shift = (cold_shock + warm_pulse).clamp(-1.0, 1.0);
+
+        if pulse_effect > 0.02 {
+            let red_tint = Vec4::new(1.0, 0.15, 0.08, pulse_effect * 0.35);
+            let total_w = out.tint.w + red_tint.w;
+            if total_w > 0.0 {
+                let blended_rgb = (out.tint.truncate() * out.tint.w + red_tint.truncate() * red_tint.w) / total_w;
+                let max_w = out.tint.w.max(red_tint.w);
+                out.tint = blended_rgb.extend(max_w);
+            }
+        }
+
+        // 4. Near-death fading consciousness blackout (< 15% HP)
+        if phys.health_fraction < 0.15 {
+            let fade_sev = ((0.15 - phys.health_fraction) / 0.15).powf(1.5);
+            let blackout = (fade_sev * 0.8 * (1.0 - 0.4 * phys.pulse)).clamp(0.0, 0.92);
+            let a = out.fade.w + blackout - out.fade.w * blackout;
+            if a > 0.0 {
+                let rgb = (out.fade.truncate() * out.fade.w * (1.0 - blackout)) / a;
+                out.fade = rgb.extend(a);
+            }
+        }
+
+        // 5. Concussion tunnel vision & physiological uniform vector
+        let tunnel_base = if phys.head_crippled { 0.45 } else { 0.0 }
+            + phys.concussion * 0.5
+            + sev * 0.45
+            + trauma * 0.35;
+        let tunnel = (tunnel_base * (1.0 - 0.2 * phys.pulse)).clamp(0.0, 0.95);
+
+        out.physiological = Vec4::new(tunnel, pulse_effect, temp_shift, trauma);
+        out
+    }
+}
+
+/// Heartbeat arterial waveform ("lub-dub"):
+/// pulse(t) = exp(-((t - 0.07)/0.05)^2) + 0.65 * exp(-((t - 0.23)/0.055)^2)
+///
+/// `t` is the time within the cardiac cycle in seconds (0.0 <= t < period).
+pub fn heartbeat_pulse(t: f32) -> f32 {
+    let s1 = (-((t - 0.07) / 0.05).powi(2)).exp();
+    let s2 = 0.65 * (-((t - 0.23) / 0.055).powi(2)).exp();
+    s1 + s2
+}
+
+/// Scales pulse frequency from 72 BPM up to 138 BPM as health drops below
+/// critical threshold (< 30% HP).
+pub fn calculate_bpm(health_fraction: f32, trauma: f32) -> f32 {
+    let base_bpm = if health_fraction < 0.30 {
+        let severity = ((0.30 - health_fraction) / 0.30).clamp(0.0, 1.0);
+        72.0 + (138.0 - 72.0) * severity
+    } else {
+        72.0
+    };
+    (base_bpm + trauma * 30.0).clamp(72.0, 138.0)
+}
+
+/// Physiological state tracking low-health feedback, arterial pulse,
+/// crippled limb effects, and concussion/hit trauma dynamics.
+#[derive(Resource, Debug, Clone)]
+pub struct PhysiologicalState {
+    /// Accumulated heart cycle phase (0.0 .. 1.0).
+    pub phase: f32,
+    /// Current heart rate in beats per minute (72.0 at 30% HP up to 138.0 at 0% HP).
+    pub bpm: f32,
+    /// Evaluated arterial double-pulse waveform value for this frame ("lub-dub").
+    pub pulse: f32,
+    /// Hit/shock trauma impulse, decaying over time (0.0 .. 2.0).
+    pub trauma: f32,
+    /// Concussion intensity (from head injury or heavy hit shock, 0.0 .. 1.0).
+    pub concussion: f32,
+    /// Low health severity: 0.0 when >= 30% HP, scaling up to 1.0 at 0% HP.
+    pub low_health_severity: f32,
+    /// Current health fraction (0.0 .. 1.0).
+    pub health_fraction: f32,
+    /// Whether the head or brain is currently crippled.
+    pub head_crippled: bool,
+    /// Count of other crippled limbs (arms, legs, torso).
+    pub other_crippled_count: usize,
+}
+
+impl Default for PhysiologicalState {
+    fn default() -> Self {
+        Self {
+            phase: 0.0,
+            bpm: 72.0,
+            pulse: 0.0,
+            trauma: 0.0,
+            concussion: 0.0,
+            low_health_severity: 0.0,
+            health_fraction: 1.0,
+            head_crippled: false,
+            other_crippled_count: 0,
+        }
+    }
+}
+
+impl PhysiologicalState {
+    /// Triggers an immediate trauma impulse on the player.
+    pub fn trigger_trauma(&mut self, impulse: f32, is_heavy: bool) {
+        self.trauma = (self.trauma + impulse).min(2.0);
+        if is_heavy {
+            // Concussion shock spike
+            self.concussion = (self.concussion + 0.6).min(1.0);
+            // Reset cardiac phase to systolic peak ("lub") for immediate shock throb
+            let period = 60.0 / self.bpm.max(1.0);
+            self.phase = (0.07 / period).fract();
+        }
+    }
+}
+
+/// Tracks base ImageSpaceGrade before physiological modifications so they can be
+/// applied frame-by-frame without compound drift.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct BaseGrade(pub ImageSpaceGrade);
+
+/// Adjusts cameras' image space grades for physiological low-health feedback,
+/// arterial heartbeat pulsation, crippled limb concussion, and hit trauma shock.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_physiological_effects(
+    time: Res<Time>,
+    game: Option<Res<crate::GameFiles>>,
+    state: Option<Res<crate::dialogue::DialogueState>>,
+    mut phys: ResMut<PhysiologicalState>,
+    mut commands: Commands,
+    mut cameras: Query<(Entity, &mut ImageSpaceGrade, Option<&mut BaseGrade>)>,
+) {
+    let dt = time.delta_secs();
+
+    // Extract player's live status if game files & dialogue state are loaded
+    let (health_fraction, head_crippled, other_crippled_count) =
+        if let (Some(game), Some(state)) = (game.as_ref(), state.as_ref()) {
+            let order = &game.0.order;
+            let gs = &state.0;
+            let cur_h = world::combat::health(order, gs, world::dialogue::PLAYER_REF)
+                .unwrap_or(100.0) as f32;
+            let max_h = world::combat::max_health(order, gs, world::dialogue::PLAYER_REF)
+                .unwrap_or(100.0)
+                .max(1.0) as f32;
+            let frac = (cur_h / max_h).clamp(0.0, 1.0);
+
+            let head = world::body_parts::is_crippled(
+                order,
+                gs,
+                world::dialogue::PLAYER_REF,
+                world::body_parts::av::FIRST_CONDITION,
+            ) || world::body_parts::is_crippled(
+                order,
+                gs,
+                world::dialogue::PLAYER_REF,
+                world::body_parts::av::LAST_CONDITION,
+            );
+
+            let mut other = 0;
+            for part in 26..=30 {
+                if world::body_parts::is_crippled(order, gs, world::dialogue::PLAYER_REF, part) {
+                    other += 1;
+                }
+            }
+            (frac, head, other)
+        } else {
+            (
+                phys.health_fraction,
+                phys.head_crippled,
+                phys.other_crippled_count,
+            )
+        };
+
+    phys.health_fraction = health_fraction;
+    phys.head_crippled = head_crippled;
+    phys.other_crippled_count = other_crippled_count;
+
+    let low_health_severity = if health_fraction < 0.30 {
+        ((0.30 - health_fraction) / 0.30).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    phys.low_health_severity = low_health_severity;
+
+    // Heart rate scaling: 72 BPM up to 138 BPM as health drops below 30% HP
+    phys.bpm = calculate_bpm(health_fraction, phys.trauma);
+    let period = 60.0 / phys.bpm.max(1.0);
+
+    // Advance cardiac cycle phase
+    if dt > 0.0 && period > 0.0 {
+        phys.phase = (phys.phase + dt / period).fract();
+        if phys.phase < 0.0 {
+            phys.phase += 1.0;
+        }
+    }
+    let t = phys.phase * period;
+    phys.pulse = heartbeat_pulse(t);
+
+    // Exponential decay of trauma & concussion
+    phys.trauma = (phys.trauma - dt * 1.5).max(0.0);
+    let min_concussion = if head_crippled { 0.45 } else { 0.0 };
+    phys.concussion = (phys.concussion - dt * 0.3).max(min_concussion);
+
+    for (entity, mut grade, base) in &mut cameras {
+        let base_val = if let Some(mut base_comp) = base {
+            if grade.physiological == Vec4::ZERO {
+                base_comp.0 = *grade;
+            }
+            base_comp.0
+        } else {
+            commands.entity(entity).insert(BaseGrade(*grade));
+            *grade
+        };
+
+        *grade = base_val.with_physiological(&phys);
+    }
 }
 
 /// The frame's seconds for the eye adaptation, as the game's average pass
@@ -285,8 +534,12 @@ impl Plugin for GradePlugin {
             ExtractComponentPlugin::<GradeDeferred>::default(),
             UniformComponentPlugin::<ImageSpaceGrade>::default(),
         ))
+        .init_resource::<PhysiologicalState>()
         // After the image space and its modifiers are set (`Update`).
-        .add_systems(PostUpdate, adapt_eyes);
+        .add_systems(
+            PostUpdate,
+            (apply_physiological_effects, adapt_eyes).chain(),
+        );
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -754,5 +1007,84 @@ mod tests {
             "{:?}",
             out.tint
         );
+    }
+
+    #[test]
+    fn physiological_heartbeat_waveform_reproduces_double_pulse() {
+        let p1 = heartbeat_pulse(0.07);
+        assert!((p1 - 1.0).abs() < 1e-3, "First peak (systole 'lub') should peak at ~1.0, got {p1}");
+
+        let p2 = heartbeat_pulse(0.23);
+        assert!((p2 - 0.65).abs() < 1e-3, "Second peak (closure 'dub') should peak at ~0.65, got {p2}");
+
+        let p_diastole = heartbeat_pulse(0.45);
+        assert!(p_diastole < 0.001, "Diastolic rest should approach 0, got {p_diastole}");
+    }
+
+    #[test]
+    fn pulse_frequency_scales_from_72_to_138_bpm_below_critical_threshold() {
+        // Above or at 30% HP: exactly 72 BPM
+        assert_eq!(calculate_bpm(1.0, 0.0), 72.0);
+        assert_eq!(calculate_bpm(0.5, 0.0), 72.0);
+        assert_eq!(calculate_bpm(0.30, 0.0), 72.0);
+
+        // Halfway below critical threshold (15% HP): 105 BPM
+        let mid = calculate_bpm(0.15, 0.0);
+        assert!((mid - 105.0).abs() < 1e-4, "Mid-threshold BPM should be 105, got {mid}");
+
+        // At 0% HP: 138 BPM
+        let max_bpm = calculate_bpm(0.0, 0.0);
+        assert!((max_bpm - 138.0).abs() < 1e-4, "Critical 0% HP BPM should be 138, got {max_bpm}");
+
+        // Trauma impulse elevates BPM
+        let trauma_bpm = calculate_bpm(0.5, 1.0);
+        assert_eq!(trauma_bpm, 102.0);
+    }
+
+    #[test]
+    fn dynamic_color_grading_desaturates_and_tunnels_under_low_health() {
+        let base = ImageSpaceGrade::NEUTRAL;
+        let mut phys = PhysiologicalState::default();
+
+        // Neutral full health produces no changes
+        let neutral = base.with_physiological(&phys);
+        assert_eq!(neutral.cinematic.x, 1.0);
+        assert_eq!(neutral.physiological.x, 0.0); // Tunnel vision = 0
+
+        // Low health (< 30% HP) causes desaturation and tunnel vision
+        phys.health_fraction = 0.10;
+        phys.low_health_severity = (0.30 - 0.10) / 0.30;
+        phys.pulse = 0.0; // Between beats (diastole)
+        let low = base.with_physiological(&phys);
+        assert!(low.cinematic.x < 0.6, "Low health should desaturate image, got {}", low.cinematic.x);
+        assert!(low.physiological.x > 0.25, "Low health should induce tunnel vision, got {}", low.physiological.x);
+        assert!(low.physiological.z < 0.0, "Shock should shift color temperature cold/cyan, got {}", low.physiological.z);
+
+        // Crippled head causes concussion tunnel vision and desaturation even at full health
+        let mut head_crippled_phys = PhysiologicalState::default();
+        head_crippled_phys.head_crippled = true;
+        let head_grade = base.with_physiological(&head_crippled_phys);
+        assert!(head_grade.physiological.x >= 0.40, "Crippled head should trigger tunnel vision");
+        assert!(head_grade.cinematic.x < 1.0, "Crippled head should reduce saturation");
+    }
+
+    #[test]
+    fn hit_trauma_impulse_triggers_shock_and_systolic_peak() {
+        let mut phys = PhysiologicalState::default();
+        assert_eq!(phys.trauma, 0.0);
+
+        // Minor hit
+        phys.trigger_trauma(0.3, false);
+        assert!((phys.trauma - 0.3).abs() < 1e-4);
+        assert_eq!(phys.concussion, 0.0);
+
+        // Heavy hit
+        phys.trigger_trauma(0.8, true);
+        assert!((phys.trauma - 1.1).abs() < 1e-4);
+        assert!(phys.concussion > 0.5);
+        // Cardiac phase should be reset to systolic peak (~0.07 s)
+        let period = 60.0 / phys.bpm;
+        let expected_phase = (0.07 / period).fract();
+        assert!((phys.phase - expected_phase).abs() < 1e-4);
     }
 }

@@ -56,6 +56,8 @@ pub struct PlayerAttack {
     /// When the last attack and the reload under way started (for the
     /// first-person animations).
     pub fired_at: Option<f32>,
+    /// When the player attempted to fire an empty weapon (dry-fire click twitch).
+    pub dry_fired_at: Option<f32>,
     pub reload_started: Option<f32>,
     /// How fast those animations play relative to the world (V.A.T.S.'s
     /// playback runs the player at its own multiplier, `vats`); `None`: as
@@ -539,6 +541,14 @@ pub fn player_attack(
             let use_ = u32::from(w.ammo_use.max(1));
             if held < use_ {
                 println!("Out of ammunition for the {}.", w.name);
+                attack.dry_fired_at = Some(now);
+                attack.next = now + 0.25;
+                if let Some(s) = order
+                    .form_by_editor_id("WPNPistolDryFire")
+                    .or_else(|| order.form_by_editor_id("WPNGunDryFire"))
+                {
+                    sounds.0.push(s);
+                }
                 return;
             }
             let clip = attack.in_clip.unwrap_or(w.clip);
@@ -558,6 +568,17 @@ pub fn player_attack(
             {
                 *state.items.entry((PLAYER_REF, item)).or_insert(0) += 1;
             }
+        } else if !w.is_melee() && w.ammo_use > 0 {
+            println!("Out of ammunition for the {}.", w.name);
+            attack.dry_fired_at = Some(now);
+            attack.next = now + 0.25;
+            if let Some(s) = order
+                .form_by_editor_id("WPNPistolDryFire")
+                .or_else(|| order.form_by_editor_id("WPNGunDryFire"))
+            {
+                sounds.0.push(s);
+            }
+            return;
         }
     }
     // Every attack wears the weapon a little (`world::combat::attack_wear`,
